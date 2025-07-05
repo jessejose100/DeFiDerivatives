@@ -252,3 +252,87 @@
   )
 )
 
+;; Advanced Risk Management and Liquidation System
+(define-public (liquidate-undercollateralized-position (contract-id uint) (contract-type (string-ascii 7)))
+  (let (
+    (current-price (var-get oracle-price))
+    (liquidation-bonus u105) ;; 5% bonus for liquidators
+  )
+    (if (is-eq contract-type "FUTURES")
+      ;; Handle futures liquidation
+      (let (
+        (contract-data (unwrap! (map-get? futures-contracts { contract-id: contract-id }) ERR_CONTRACT_NOT_FOUND))
+        (creator (get creator contract-data))
+        (strike-price (get strike-price contract-data))
+        (contract-size (get contract-size contract-data))
+        (collateral-amount (get collateral-amount contract-data))
+        (current-value (* contract-size current-price))
+        (strike-value (* contract-size strike-price))
+        (unrealized-loss (if (> current-value strike-value) u0 (- strike-value current-value)))
+        (collateral-ratio (if (> unrealized-loss u0) 
+          (/ (* (- collateral-amount unrealized-loss) u100) strike-value) u200))
+      )
+        (begin
+          (asserts! (not (get is-settled contract-data)) ERR_ALREADY_SETTLED)
+          (asserts! (< collateral-ratio LIQUIDATION_THRESHOLD) ERR_INSUFFICIENT_COLLATERAL)
+          
+          ;; Calculate liquidation amounts
+          (let (
+            (liquidation-amount (/ (* collateral-amount liquidation-bonus) u100))
+            (remaining-collateral (- collateral-amount liquidation-amount))
+          )
+            ;; Mark contract as settled
+            (map-set futures-contracts
+              { contract-id: contract-id }
+              (merge contract-data { 
+                is-settled: true, 
+                settlement-price: (some current-price) 
+              })
+            )
+            
+            ;; Reward liquidator
+            (update-user-balance tx-sender (get underlying-asset contract-data)
+              (+ (get-user-balance tx-sender (get underlying-asset contract-data)) liquidation-amount))
+            
+            ;; Return remaining collateral to creator
+            (if (> remaining-collateral u0)
+              (update-user-balance creator (get underlying-asset contract-data)
+                (+ (get-user-balance creator (get underlying-asset contract-data)) remaining-collateral))
+              true)
+            
+            ;; Clear collateral deposit
+            (map-delete collateral-deposits 
+              { user: creator, contract-id: contract-id, contract-type: "FUTURES" })
+            
+            (ok liquidation-amount)
+          )
+        )
+      )
+      ;; Handle options liquidation (similar logic for options contracts)
+      (let (
+        (contract-data (unwrap! (map-get? options-contracts { contract-id: contract-id }) ERR_CONTRACT_NOT_FOUND))
+        (creator (get creator contract-data))
+        (collateral-amount (get collateral-amount contract-data))
+        (liquidation-amount (/ (* collateral-amount liquidation-bonus) u100))
+      )
+        (begin
+          (asserts! (not (get is-settled contract-data)) ERR_ALREADY_SETTLED)
+          
+          ;; Mark as settled and liquidate
+          (map-set options-contracts
+            { contract-id: contract-id }
+            (merge contract-data { is-settled: true })
+          )
+          
+          ;; Transfer collateral to liquidator
+          (update-user-balance tx-sender (get underlying-asset contract-data)
+            (+ (get-user-balance tx-sender (get underlying-asset contract-data)) liquidation-amount))
+          
+          (ok liquidation-amount)
+        )
+      )
+    )
+  )
+)
+
+
